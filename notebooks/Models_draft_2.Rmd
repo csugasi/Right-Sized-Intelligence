@@ -1,0 +1,796 @@
+---
+title: "Right-Sized Intelligence: Using Model Capacity and Training Stage to Choose Effective Large Language Models"
+output: html_document
+date: "2026-04-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(lmtest)
+library(sandwich)
+library(stargazer)
+library(ggplot2)
+library(here)
+```
+
+## Data Prep
+
+```{r}
+hf_dataset <- read.csv(here("data/interim/hf_dataset_clean.csv"))
+
+# log transform model size based on scale and descriptive analysis check (parameters in billions)
+hf_dataset$log_size <- log10(hf_dataset$x_params_b)
+
+# Create Dummy Variable for Type (training stage) using str_detect to avoid emoji encoding issues
+hf_dataset <- hf_dataset %>% 
+  mutate(
+    training_stage = case_when(
+      str_detect(type, "fine-tuned")  ~ "Fine-tuned", 
+      str_detect(type, "merges")      ~ "Base-Merge",
+      str_detect(type, "chat")        ~ "Chat-Instruct",
+      type == "🟢 pretrained"  ~ "Pretrained",
+      #str_detect(type, "continuously")~ "Other",
+      #str_detect(type, "multimodal")  ~ "Other",
+      TRUE ~ "Other"
+    ),
+    # Convert to factor so the linear model treats it as categorical
+    training_stage = as.factor(training_stage)
+  )
+hf_dataset %>% 
+  group_by(training_stage) %>% 
+  summarise(n = n())
+```
+
+## Simple Model
+
+```{r}
+# Create simple baseline performance model of just model size. 
+simple <- lm(mmlu_pro ~ log_size, data = hf_dataset)
+summary(simple)
+
+simple_rse <- coeftest(simple, vcov = vcovHC(simple))
+simple_rse
+```
+10x increase in size = ~19.5 point increase. Not really trusting p-values, but this is in line directionally with scaling laws as understood
+
+```{r}
+# Plot size x by performance y with model line
+ggplot(hf_dataset, aes(x = log_size, y = mmlu_pro)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth = 1.2) +
+  labs(title = "Simple Model: Performance by Model Size", 
+       x = "Log10(Parameters)", 
+       y = "MMLU-PRO Score") +
+  theme_minimal()
+
+# Fitted vs Residuals
+plot(simple, which = 1, main = "Simple Model: Residuals vs Fitted", pch=16, col="darkorange")
+```
+Understimates anything smaller than ~300M parameters then a mix of pos/neg residuals
+
+
+## Main Effect Model (Model 2)
+
+```{r}
+model_2 <- lm(mmlu_pro ~ log_size + training_stage, data = hf_dataset)
+summary(model_2)
+
+m2_rse <- coeftest(model_2, vcov = vcovHC(model_2))
+m2_rse
+```
+At 1B parameters (0 = 10^0 * Billion parameters): Merged models score 13 pts at 1B parameters, chat models score 10 points, fine-tuned 10, pretrained 6. A 10x size increase adds 18 points in base mergeson average.
+
+```{r}
+# Scatterplot with interaction lines
+df_no_other <- hf_dataset %>%
+  filter(hf_dataset$training_stage != "Other")
+ggplot(df_no_other, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  #geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  theme_minimal()
+```
+
+
+```{r}
+# F test comparing to the simple model using robust standard errors
+waldtest(simple, model_2, vcov = vcovHC)
+```
+Model 2 has a better fit and is preferred
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_2_predictions = predict(model_2),
+    model_2_residuals   = resid(model_2)
+  )
+
+plot_model_2a <- hf_dataset_resid %>%
+  ggplot(aes(x = log_size, y = model_2_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_2b <- hf_dataset_resid %>%
+  ggplot(aes(x = model_2_predictions, y = model_2_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_2a
+plot_model_2b
+
+```
+
+
+## Main Effects + Control (Model 3)
+
+```{r}
+model_3 <- lm(mmlu_pro ~ log_size + training_stage + if_eval, data = hf_dataset)
+summary(model_3)
+
+m3_rse <- coeftest(model_3, vcov = vcovHC(model_3))
+m3_rse
+```
+At 1B parameters (0 = 10^0 * Billion parameters) and an IFEval score of 0: Merged models score 2 pts, chat models score -2 points, fine-tuned ~0, pretrained ~0. A 10x size increase adds 14 points in base merges on average. A 1 point increase in instruction following score equates to a small 0.3 increase in performance score (a 10pt increase = 3 points in performance, +30 IFEval = 10 MMLU-Pro).
+
+
+```{r}
+# F test comparing to Model 2
+waldtest(model_2, model_3, vcov = vcovHC)
+```
+Model 3 has a better fit and is preferred. 
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_3_predictions = predict(model_3),
+    model_3_residuals   = resid(model_3)
+  )
+3
+
+plot_model_3 <- hf_dataset_resid %>%
+  ggplot(aes(x = model_3_predictions, y = model_3_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_3
+```
+
+
+
+## Interaction Model (Model 4)
+
+```{r}
+# Add the interaction of size and training stage. 
+# Using '*' automatically includes log_size + training_stage + the interaction
+model_4 <- lm(mmlu_pro ~ log_size * training_stage, data = hf_dataset)
+summary(model_4)
+
+m4_rse <- coeftest(model_4, vcov = vcovHC(model_4))
+m4_rse
+```
+Interaction: fits a line for each training stage (i.e. base-merge is intercept + B1log_size, chat is (intercept + B2chat + (B1log_size + B6sizexchat)*size)) 
+At 1B parameters (0 = 10^1 * billion parameters): base merges score 10 points, chat ~8, fine-tuned 9, pretrained ~8. 10x increase in parameters = 21 point increase in base merges, ~20 for chat, ~19 for fine-tuned, and 10 for pretrained. Major increase in training stage p-values. Only significant interaction (if we're trusting p-values at all) is the pretrained penalty for scaling. 
+
+
+```{r}
+# F test to see if interaction adds anything compared to just main effects
+waldtest(model_2, model_4, vcov = vcovHC)
+```
+Model 4 has a better fit and is preferred. 
+
+```{r}
+# F test to compare Ifeval vs interaction X
+anova(model_4, model_3, test = "F" )
+```
+
+
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_4_predictions = predict(model_4),
+    model_4_residuals   = resid(model_4)
+  )
+
+plot_model_4 <- hf_dataset_resid %>%
+  ggplot(aes(x = model_4_predictions, y = model_4_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_4
+```
+
+
+
+## Full Control Model
+
+```{r}
+# Add the if_eval control variable to the interaction model
+full <- lm(mmlu_pro ~ log_size * training_stage + if_eval, data = hf_dataset)
+full_1 <- lm(mmlu_pro ~ log_size * training_stage + if_eval + I(log_size^2), data = hf_dataset)
+summary(full_1)
+
+full_rse <- coeftest(full, vcov = vcovHC(full))
+full_rse
+```
+At 1B parameters (0 = 10^1 * billion parameters) and 0 IFEval score: base merges score -1 points, chat ~3, fine-tuned 0, pretrained 2. 10x increase in parameters = 17 point increase in base merges, ~15 for chat, ~14 for fine-tuned, and 9 for pretrained. 1 pt increase in IFEval score equates to 0.3 pt increase in MMLU-Pro (or +10 points of IFEval = +3 points of performance, +30 IFEval = +10 MMLU-Pro). If we're trusting p-values at all, size and if_eval have extremely low p-values. Only significant interactions are the pretrained and to some degree fine-tuned penalties for scaling. Ignoring other since it's a very small amount of models (multi modal and continuously pretrained)
+
+
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(model_3, full, vcov = vcovHC)
+```
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(model_4, full, vcov = vcovHC)
+```
+
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(simple, full, vcov = vcovHC)
+```
+Full model is a better fit and preferred over the simple model, model 3 and model 4.
+
+
+```{r}
+results <- waldtest(simple, model_2, model_3, full,vcov = vcovHC)
+print(results)
+
+results_4 <- waldtest(simple, model_2, model_4, full,vcov = vcovHC)
+print(results_4)
+
+library(broom)
+library(dplyr)
+
+w1 <- waldtest(simple,model_2,vcov = vcovHC)
+w2 <- waldtest(model_2,model_3,vcov = vcovHC)
+w3 <- waldtest(model_2,model_4,vcov = vcovHC)
+w4 <- waldtest(model_3,full,vcov = vcovHC)
+w5 <- waldtest(model_4,full,vcov = vcovHC)
+w6 <- waldtest(simple,full,vcov = vcovHC)
+tidy(w1)
+
+F_comparison_table <- rbind(
+  tidy(w1)[2, ] %>% mutate(Comparison = "simple vs model_2"),
+  tidy(w2)[2, ] %>% mutate(Comparison = "model_2 vs model_3"),
+  tidy(w3)[2, ] %>% mutate(Comparison = "model_2 vs model_4"),
+  tidy(w4)[2, ] %>% mutate(Comparison = "model_3 vs full"),
+  tidy(w5)[2, ] %>% mutate(Comparison = "model_4 vs full"),
+  tidy(w6)[2, ] %>% mutate(Comparison = "simple vs full"),
+deparse.level = 1) %>%
+  select(Comparison, statistic, p.value, df, df.residual)
+
+print(F_comparison_table)
+
+f1 <- round(w1$F[2],3)
+p1 <- w1$`Pr(>F)`[2]
+f2 <- round(w2$F[2],3)
+p2 <- w2$`Pr(>F)`[2]
+f3 <- round(w3$F[2],3)
+p3 <- w3$`Pr(>F)`[2]
+f4 <- round(w4$F[2],3)
+p4 <- w4$`Pr(>F)`[2]
+f5 <- round(w5$F[2],3)
+p5 <- w5$`Pr(>F)`[2]
+f6 <- round(w6$F[2],3)
+p6 <- w6$`Pr(>F)`[2]
+
+get_stars <- function(p) {
+  if (p < 0.01) return("***")
+  if (p < 0.05) return("**")
+  if (p < 0.1)  return("*")
+  return("")
+}
+
+wald_row <- c("Wald F-test",
+              " ",
+              paste0(f1,get_stars(p1)), 
+              paste0(f2,get_stars(p2)),
+              paste0(f3,get_stars(p3)),
+              #paste0(f4,get_stars(p4)),
+              paste0(f5,get_stars(p5))#,
+              #paste0(f6,get_stars(p6))
+              )
+
+```
+
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    full_predictions = predict(full),
+    full_residuals   = resid(full)
+  )
+
+plot_full <- hf_dataset_resid %>%
+  ggplot(aes(x = full_predictions, y = full_residuals)) + 
+  geom_point() + stat_smooth() +
+  labs(title = "Residuals vs Fitted Values", y="Residuals", x= "Fitted Values") +
+  theme_minimal()
+
+plot_full
+
+full_preds <- predict(full, new.data=hf_dataset, model_type="prediction",interval="confidence", level = 0.95)
+hf_dataset_preds <- cbind(hf_dataset,full_preds)
+hf_dataset_preds <- hf_dataset_preds %>%
+  filter(hf_dataset_preds$training_stage != "Other")
+view(hf_dataset_preds)
+
+ggplot(hf_dataset_preds, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point() +
+  geom_line(data=hf_dataset_preds, aes(y = fit)) +
+  coord_cartesian(xlim = c(0, 2)) +
+  geom_ribbon(data=hf_dataset_preds, aes(ymin = lwr, ymax = upr, y=fit), alpha = 0.2, color = NA)
+
+ggplot(hf_dataset_preds, aes(x=log_size, y=fit, color=training_stage)) +
+  #geom_point() +
+  #geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, color = NA) +
+  stat_smooth() +
+  labs(title = "CI by Training Stage", y="Predicted Value", x= "log Parameters") + 
+  theme_minimal()
+```
+
+
+```{r}
+library(marginaleffects)
+
+plot_predictions(full, condition= list("log_size","if_eval"=45.66, "training_stage"))
+plot_slopes(full, variables = "training_stage", condition= list("log_size","if_eval"=45.66))
+```
+
+
+```{r}
+# predicted values across size, if_eval held at median
+pred_grid <- expand.grid(
+  log_size = seq(min(hf_dataset$log_size),
+                 max(hf_dataset$log_size),
+                 length.out = 100),
+  training_stage = levels(hf_dataset$training_stage),
+  if_eval = 45.66 # median IFEval score
+) %>%
+  filter(training_stage != "Other")
+
+pred_grid$pred_mmlu_pro <- predict(full, newdata = pred_grid)
+
+ggplot(pred_grid, aes(x = log_size, y = pred_mmlu_pro, color = training_stage)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Log Parameter Count",
+    y = "Predicted MMLU=Pro",
+    color = "Training Stage"
+  ) +
+  theme_minimal()
+
+pred_ci <- predict(full, newdata = pred_grid, interval = "confidence", level = 0.95)
+pred_grid <- cbind(pred_grid, pred_ci)
+
+dens <- density(hf_dataset$log_size, na.rm = TRUE, from = 0, to = 1)
+dens_df <- data.frame(
+  x = dens$x,
+  y = 0.3 + dens$y / 50
+)
+
+  # x-axis labels 
+  x_breaks <- c(seq(0, 0.8, 0.2), 0.95)
+  x_labels <- c("0", "20", "40", "60", "80", "100%")
+
+  # y-axis labels 
+  y_breaks <- seq(0.2, 0.8, by = 0.1)
+  y_labels <- c("20", "30", "40", "50", "60", "70", "80%")
+stage_colors <- c(
+  "Pretrained"     = "#E69F00",
+  "Base-Merge"     = "#4A90D9",
+  "Chat-Instruct"  = "#2C5F8A",
+  "Fine-tuned"     = "#1A3A57"
+)
+
+ggplot(pred_grid, aes(x = log_size, y = fit, color = training_stage, fill = training_stage)) +
+#  geom_line(data = dens_df, aes(x = x, y = y), linewidth = 0.7, color = "black") +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 25.84, linetype = "dashed", color = "grey50") +
+  annotate("text", x=-2, y=28, label="Mean MMLU-Pro Score", color="grey50") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  scale_x_continuous(
+    breaks = c(seq(-2,1,1),2),
+    labels = c("10M","100M","1B","10B","100B")
+  ) +
+  labs(
+    x = "Parameter Count (log)",
+    y = "Predicted MMLU-Pro",
+    color = "Training Stage",
+    fill = "Training Stage"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Repurposing Alex's code
+# checking table we already used
+library(data.table)
+data.table(pred_grid)
+########################
+
+# creating predictions and CI
+pred_data <- data.frame( 
+  training_stage = levels(hf_dataset$training_stage), 
+  log_size = rep(seq(from = min(hf_dataset$log_size, na.rm = T), to = max(hf_dataset$log_size, na.rm = T), length.out = 100) , 5),
+  if_eval = 45.66 # median IFEval score
+)
+
+pred_data$fit     <- predict.lm(full, newdata = pred_data, interval = 'confidence')[ , 'fit']
+pred_data$se.fit  <- predict.lm(full, newdata = pred_data, se.fit = T,)$se.fit
+pred_data$low.ci  <- predict.lm(full, newdata = pred_data, interval = 'confidence', level = 0.95)[ , 'lwr']
+pred_data$high.ci <- predict.lm(full, newdata = pred_data, interval = 'confidence', level = 0.95)[ , 'upr']
+
+pred_data <- data.table(pred_data) %>%
+  filter(training_stage != "Other")
+pred_data
+
+stage_colors <- c(
+  "Pretrained"     = "#fdb515", # Orange: "#E69F00",
+  "Base-Merge"     = "#4A90D9",
+  "Chat-Instruct"  = "#2C5F8A",
+  "Fine-tuned"     = "#003057" # Dark Blue replaced by Berkeley#1A3A57"
+)
+
+ggplot(pred_data, aes(x = log_size, y = fit, color = training_stage, fill = training_stage)) +
+ # geom_line(data = dens_df, aes(x = x, y = y), linewidth = 0.7, color = "black") +
+  geom_ribbon(aes(x=log_size,ymin = low.ci, ymax = high.ci), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 25.84, linetype = "dashed", color = "grey50") +
+  annotate("text", x=-2, y=29, label="Mean MMLU-Pro Score", color="grey50") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  scale_x_continuous(
+    breaks = c(seq(-2,1,1),2),
+    labels = c("10M","100M","1B","10B","100B")
+  ) +
+  labs(
+    title = "Predicted Performance By Training Stage",
+    subtitle = "Full Model Prediction across LLM Size",
+    caption = "Source: HuggingFace Open LLM Leaderboard Contents Dataset 2024",
+    x = "Parameter Count (log)",
+    y = "Predicted MMLU-Pro",
+    color = "Training Stage",
+    fill = "Training Stage"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), plot.caption = element_text(hjust = 0))
+ggplot(pred_grid, aes(x = log_size, y = fit, color = training_stage, fill = training_stage)) +
+#  geom_line(data = dens_df, aes(x = x, y = y), linewidth = 0.7, color = "black") +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 25.84, linetype = "dashed", color = "grey50") +
+  annotate("text", x=-2, y=29, label="Mean MMLU-Pro Score", color="grey50") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  scale_x_continuous(
+    breaks = c(seq(-2,1,1),2),
+    labels = c("10M","100M","1B","10B","100B")
+  ) +
+  labs(
+    title = "Predicted Performance By Training Stage",
+    subtitle = "Full Model Prediction across LLM Size",
+    caption = "Source: HuggingFace Open LLM Leaderboard Contents Dataset 2024",
+    x = "Parameter Count (log)",
+    y = "Predicted MMLU-Pro",
+    color = "Training Stage",
+    fill = "Training Stage"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), plot.caption = element_text(hjust = 0))
+
+###################
+#   # density line to be drawn inside plotting window
+#   dens <- density(d$voteshare_republican_2016, na.rm = TRUE, from = 0, to = 1)
+#   dens_df <- data.frame(
+#     x = dens$x,
+#     y = 0.3 + dens$y / 50
+#   )
+# 
+#     # density line inside window
+# geom_line(
+#   data = dens_df,
+#   aes(x = x, y = y),
+#   linewidth = 0.7,
+#   color = "black"
+# ) +
+#   
+# ############  
+# full_pred_type_plot_gg <- function(alternative = 3, title = "") {
+# 
+#   label_vector <- c("Latino Cue", "Black Cue", "Arab Cue")
+#   
+#   pal <- park_palette("Saguaro", 3)
+#   pal_index <- c(3, 2, 1)
+#   
+#   alt_fill <- scales::alpha(pal[pal_index[alternative]], 0.9)
+#   grey_fill <- scales::alpha("grey70", 0.5)
+# 
+#   # subset prediction data
+#   pd_white <- pred_data |> filter(ethnic_cue == 0)
+#   pd_alt   <- pred_data |> filter(ethnic_cue == alternative)
+# 
+#   # density line to be drawn inside plotting window
+#   dens <- density(d$voteshare_republican_2016, na.rm = TRUE, from = 0, to = 1)
+#   dens_df <- data.frame(
+#     x = dens$x,
+#     y = 0.3 + dens$y / 50
+#   )
+# 
+#   # x-axis labels 
+#   x_breaks <- c(seq(0, 0.8, 0.2), 0.95)
+#   x_labels <- c("0", "20", "40", "60", "80", "100%")
+# 
+#   # y-axis labels 
+#   y_breaks <- seq(0.2, 0.8, by = 0.1)
+#   y_labels <- c("20", "30", "40", "50", "60", "70", "80%")
+# 
+#   # Build a combined data frame for legend mapping
+#   ribbon_df <- bind_rows(
+#     pd_alt   |> mutate(group = label_vector[alternative]),
+#     pd_white |> mutate(group = "White Cue")
+#   )
+# 
+#   line_df <- bind_rows(
+#     pd_alt   |> mutate(group = label_vector[alternative]),
+#     pd_white |> mutate(group = "White Cue")
+#   )
+# 
+#   ggplot() +
+#     # CI ribbons
+#     geom_ribbon(
+#       data = ribbon_df,
+#       aes(
+#         x = voteshare_republican_2016,
+#         ymin = low.ci,
+#         ymax = high.ci,
+#         fill = group
+#       ),
+#       color = NA
+#     ) +
+#     # lines
+#     geom_line(
+#       data = line_df,
+#       aes(x = voteshare_republican_2016, y = fit, linetype = group),
+#       linewidth = 0.8,
+#       color = "black"
+#     ) +
+#     # density line inside window
+#     geom_line(
+#       data = dens_df,
+#       aes(x = x, y = y),
+#       linewidth = 0.7,
+#       color = "black"
+#     ) +
+#     # axes and labels
+#     scale_x_continuous(
+#       limits = c(0, 1),
+#       breaks = x_breaks,
+#       labels = x_labels
+#     ) +
+#     scale_y_continuous(
+#       limits = c(0.3, 0.8),
+#       breaks = y_breaks,
+#       labels = y_labels
+#     ) +
+#     labs(
+#       title = title,
+#       x = "Trump Vote Share",
+#       y = "Probability Respond"
+#     ) +
+#     scale_fill_manual(
+#       values = c(
+#         setNames(alt_fill, label_vector[alternative]),
+#         "White Cue" = grey_fill
+#       )
+#     ) +
+#     # dashed for alt, solid for white
+#     scale_linetype_manual(
+#       values = c(
+#         setNames("dotted", label_vector[alternative]),
+#         "White Cue" = "solid"
+#       )
+#     ) +
+#     theme_classic(base_size = 14) +
+#     theme(
+#       legend.position = c(0.15, 0.15),
+#       legend.justification = c(0, 0),
+#       legend.title = element_blank(),
+#       legend.background = element_blank(),
+#       legend.key = element_rect(fill = NA, color = NA),
+#       plot.title = element_text(hjust = 0.5)
+#     )
+# }
+# 
+# 
+# library(tidyverse) 
+# library(data.table)
+# library(ggplot2) 
+# library(patchwork) 
+# library(nationalparkcolors)
+# library(here) 
+# 
+# ## Load Analyis Package
+# devtools::load_all()
+# 
+# ## Load data 
+# d <- load_data(
+#   filepath = here("data/processed/experiment_data.csv")
+# )
+# 
+# election_returns <- fread(
+#   file = here("data/processed/election_returns.csv"), 
+#   colClasses = c("county_fips" = "character")
+# )
+# 
+# setkeyv(x = election_returns, cols = "county_fips")
+# d <- merge(d, election_returns, by = "county_fips", all.x = TRUE)
+# 
+# ## Estimate Model 
+# model_ = d[ ,   lm(got_response ~ factor(ethnic_cue) * voteshare_republican_2016)]
+# 
+# ## Set up prediction data
+# pred_data <- data.frame( 
+#   ethnic_cue = factor(c(rep(0, 100), rep(1, 100), rep(2, 100), rep(3, 100))), 
+#   voteshare_republican_2016 = rep(seq(from = min(d$voteshare_republican_2016, na.rm = T), to = max(d$voteshare_republican_2016, na.rm = T), length.out = 100) , 4)
+# )
+# 
+# pred_data$fit     <- predict.lm(model_, newdata = pred_data, interval = 'confidence')[ , 'fit']
+# pred_data$se.fit  <- predict.lm(model_, newdata = pred_data, se.fit = T,)$se.fit
+# pred_data$low.ci  <- predict.lm(model_, newdata = pred_data, interval = 'confidence', level = 0.95)[ , 'lwr']
+# pred_data$high.ci <- predict.lm(model_, newdata = pred_data, interval = 'confidence', level = 0.95)[ , 'upr']
+# 
+# pred_data <- data.table(pred_data)
+# 
+# ## Make Plots 
+# latino_plot <- voteshare_hte_plot_gg(alternative = 1, title = "Latino Cue")
+# black_plot  <- voteshare_hte_plot_gg(alternative = 2, title = "Black Cue")
+# arab_plot   <- voteshare_hte_plot_gg(alternative = 3, title = "Arab/Muslim Cue")
+# 
+# (latino_plot + black_plot + arab_plot) + 
+#   plot_layout(axis_titles = "collect")
+# 
+# ggsave(
+#   filename = here("plots/hte_plot.png"), 
+#   height = 4, 
+#   width = 10, 
+#   unit = "in", 
+#   dpi = 300
+#   )
+```
+
+
+
+
+```{r}
+# Scatterplot with interaction lines
+ggplot(df_no_other, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  theme_minimal()
+
+# Fitted vs Residuals for Full Model
+plot(full, which = 1, main = "Full Model: Residuals vs Fitted", pch=16, col="purple")
+```
+```{r}
+# Scatterplot with interaction lines
+ggplot(df_no_other, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  facet_wrap(~training_stage) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  theme_minimal()
+```
+```{r}
+# Scatterplot with interaction lines
+df_no_other_pred <- hf_dataset_resid %>%
+  filter(hf_dataset$training_stage != "Other")
+ggplot(df_no_other_pred, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  scale_color_manual(values = stage_colors) +
+  scale_fill_manual(values = stage_colors) +
+  theme_minimal()
+# 
+# library(sjPlot)
+# library(sjmisc)
+# library(ggplot2)
+# plot_model(full,type="int") +
+#   theme(theme_sjplot)
+# 
+# plot_model(full, type = "pred", terms = c("log_size","training_stage"))
+```
+
+
+```{r}
+ggplot(hf_dataset_resid, aes(x = full_predictions, y = full_residuals)) + 
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) + 
+  facet_wrap(~training_stage) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted by Training Stage",
+       x = "Fitted Values",
+       y = "Residuals")
+
+```
+```{r}
+hist(full_rse)
+qqnorm(full_rse)
+qqline(full_rse, lwd=2)
+```
+## Descriptive Statistics Table
+```{r results='asis', echo=FALSE}
+desc_stats <- hf_dataset %>% 
+  group_by(training_stage) %>% 
+  summarise(n = n(), 
+            avg_size_B = mean(x_params_b),
+            size_range = paste0(min(x_params_b), " - ", max(x_params_b)),
+            avg_mmlu_pro = mean(mmlu_pro),
+            avg_if_eval = mean(if_eval)
+  )
+
+desc_stats
+suppressWarnings(
+  stargazer(desc_stats,
+            type = "text",
+            column.labels = c("Training Stage", "Number of Models", "Avg Size", "Size Range", "Avg MMLU-Pro", "Avg IFEval", "Full Model"),
+            summary = FALSE)
+)
+```
+
+
+## Regression Table Output
+
+```{r results='asis', echo=FALSE}
+# Extract the robust standard errors column from each coeftest object
+se_simple <- simple_rse[, 2]
+se_m2 <- m2_rse[, 2]
+se_m3 <- m3_rse[, 2]
+se_m4 <- m4_rse[, 2]
+se_full <- full_rse[, 2]
+
+suppressWarnings(
+  stargazer(simple, model_2, model_3, model_4, full, 
+            type = "html", 
+            title = "Model Performance Across Size, Training Stage, and Instruction Following",
+            dep.var.labels = "MMLU-PRO Score",
+            column.labels = c("Simple", "Main Effects", "+IFEval", "Interaction", "Full Model"),
+            covariate.labels = c("Log(Parameters)", 
+                                 "Chat-Instruct", 
+                                 "Fine-tuned", 
+                                 "Other", 
+                                 "Pretrained", 
+                                 "IFEval Score", 
+                                 "Log(Params) × Chat-Instruct", 
+                                 "Log(Params) × Fine-tuned", 
+                                 "Log(Params) × Other", 
+                                 "Log(Params) × Pretrained", 
+                                 "Constant"),
+
+            omit.stat = "f",
+            add.lines = list(wald_row),
+            notes = "Note: 'Base-Merge' is the reference category for Training Stage. Robust standard errors (HC3) reported in parentheses.",
+            se = list(se_simple, se_m2, se_m3, se_m4, se_full), 
+            header = FALSE)
+)

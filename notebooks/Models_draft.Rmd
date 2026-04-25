@@ -1,0 +1,284 @@
+---
+title: "Right-Sized Intelligence: Using Model Capacity and Training Stage to Choose Effective Large Language Models"
+output: html_document
+date: "2026-04-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(lmtest)
+library(sandwich)
+library(stargazer)
+library(ggplot2)
+library(here)
+```
+
+## Data Prep
+
+```{r}
+hf_dataset <- read.csv(here("data/interim/hf_dataset_clean.csv"))
+
+# log transform model size based on scale and descriptive analysis check (parameters in billions)
+hf_dataset$log_size <- log10(hf_dataset$x_params_b)
+
+# Create Dummy Variable for Type (training stage) using str_detect to avoid emoji encoding issues
+hf_dataset <- hf_dataset %>% 
+  mutate(
+    training_stage = case_when(
+      str_detect(type, "fine-tuned") ~ "Fine-tuned", 
+      str_detect(type, "merges")     ~ "Base-Merge",
+      str_detect(type, "chat")       ~ "Chat-Instruct",
+      str_detect(type, "pretrained") ~ "Pretrained",
+      TRUE ~ "Other"
+    ),
+    # Convert to factor so the linear model treats it as categorical
+    training_stage = as.factor(training_stage)
+  )
+```
+
+## Simple Model
+
+```{r}
+# Create simple baseline performance model of just model size. 
+simple <- lm(mmlu_pro ~ log_size, data = hf_dataset)
+summary(simple)
+
+simple_rse <- coeftest(simple, vcov = vcovHC(simple))
+simple_rse
+```
+10x increase in size = ~19.5 point increase. Not really trusting p-values, but this is in line directionally with scaling laws as understood
+
+```{r}
+# Plot size x by performance y with model line
+ggplot(hf_dataset, aes(x = log_size, y = mmlu_pro)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth = 1.2) +
+  labs(title = "Simple Model: Performance by Model Size", 
+       x = "Log10(Parameters)", 
+       y = "MMLU-PRO Score") +
+  theme_minimal()
+
+# Fitted vs Residuals
+plot(simple, which = 1, main = "Simple Model: Residuals vs Fitted", pch=16, col="darkorange")
+```
+Understimates anything smaller than ~300M parameters then a mix of pos/neg residuals
+
+
+## Main Effect Model (Model 2)
+
+```{r}
+model_2 <- lm(mmlu_pro ~ log_size + training_stage, data = hf_dataset)
+summary(model_2)
+
+m2_rse <- coeftest(model_2, vcov = vcovHC(model_2))
+m2_rse
+```
+At 1B parameters (0 = 10^0 * Billion parameters): Merged models score 13 pts at 1B parameters, chat models score 10 points, fine-tuned 10, pretrained 6. A 10x size increase adds 18 points in base mergeson average.
+
+```{r}
+# Scatterplot with interaction lines
+ggplot(hf_dataset, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  theme_minimal()
+```
+
+
+```{r}
+# F test comparing to the simple model using robust standard errors
+waldtest(simple, model_2, vcov = vcovHC)
+```
+Model 2 has a better fit and is preferred
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_2_predictions = predict(model_2),
+    model_2_residuals   = resid(model_2)
+  )
+
+plot_model_2a <- hf_dataset_resid %>%
+  ggplot(aes(x = log_size, y = model_2_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_2b <- hf_dataset_resid %>%
+  ggplot(aes(x = model_2_predictions, y = model_2_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_2a
+plot_model_2b
+
+```
+
+
+## Main Effects + Control (Model 3)
+
+```{r}
+model_3 <- lm(mmlu_pro ~ log_size + training_stage + if_eval, data = hf_dataset)
+summary(model_3)
+
+m3_rse <- coeftest(model_3, vcov = vcovHC(model_3))
+m3_rse
+```
+At 1B parameters (0 = 10^0 * Billion parameters) and an IFEval score of 0: Merged models score 2 pts, chat models score -2 points, fine-tuned ~0, pretrained ~0. A 10x size increase adds 14 points in base merges on average. A 1 point increase in instruction following score equates to a small 0.3 increase in performance score (a 10pt increase = 3 points in performance, +30 IFEval = 10 MMLU-Pro).
+
+
+```{r}
+# F test comparing to Model 2
+waldtest(model_2, model_3, vcov = vcovHC)
+```
+Model 3 has a better fit and is preferred. 
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_3_predictions = predict(model_3),
+    model_3_residuals   = resid(model_3)
+  )
+3
+
+plot_model_3 <- hf_dataset_resid %>%
+  ggplot(aes(x = model_3_predictions, y = model_3_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_3
+```
+
+
+
+## Interaction Model (Model 4)
+
+```{r}
+# Add the interaction of size and training stage. 
+# Using '*' automatically includes log_size + training_stage + the interaction
+model_4 <- lm(mmlu_pro ~ log_size * training_stage, data = hf_dataset)
+summary(model_4)
+
+m4_rse <- coeftest(model_4, vcov = vcovHC(model_4))
+m4_rse
+```
+Interaction: fits a line for each training stage (i.e. base-merge is intercept + B1log_size, chat is (intercept + B2chat + (B1log_size + B6sizexchat)*size)) 
+At 1B parameters (0 = 10^1 * billion parameters): base merges score 10 points, chat ~8, fine-tuned 9, pretrained ~8. 10x increase in parameters = 21 point increase in base merges, ~20 for chat, ~19 for fine-tuned, and 10 for pretrained. Major increase in training stage p-values. Only significant interaction (if we're trusting p-values at all) is the pretrained penalty for scaling. 
+
+
+```{r}
+# F test to see if interaction adds anything compared to just main effects
+waldtest(model_2, model_4, vcov = vcovHC)
+```
+Model 4 has a better fit and is preferred. 
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    model_4_predictions = predict(model_4),
+    model_4_residuals   = resid(model_4)
+  )
+3
+
+plot_model_4 <- hf_dataset_resid %>%
+  ggplot(aes(x = model_4_predictions, y = model_4_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_model_4
+```
+
+
+
+## Full Control Model
+
+```{r}
+# Add the if_eval control variable to the interaction model
+full <- lm(mmlu_pro ~ log_size * training_stage + if_eval, data = hf_dataset)
+summary(full)
+
+full_rse <- coeftest(full, vcov = vcovHC(full))
+full_rse
+```
+At 1B parameters (0 = 10^1 * billion parameters) and 0 IFEval score: base merges score -1 points, chat ~3, fine-tuned 0, pretrained 2. 10x increase in parameters = 17 point increase in base merges, ~15 for chat, ~14 for fine-tuned, and 9 for pretrained. 1 pt increase in IFEval score equates to 0.3 pt increase in MMLU-Pro (or +10 points of IFEval = +3 points of performance, +30 IFEval = +10 MMLU-Pro). If we're trusting p-values at all, size and if_eval have extremely low p-values. Only significant interactions are the pretrained and to some degree fine-tuned penalties for scaling. Ignoring other since it's a very small amount of models (multi modal and continuously pretrained)
+
+
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(model_3, full, vcov = vcovHC)
+```
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(model_4, full, vcov = vcovHC)
+```
+
+```{r}
+# Final F-test: Does the full model perform significantly better than the simple baseline?
+waldtest(simple, full, vcov = vcovHC)
+```
+Full model is a better fit and preferred over the simple model, model 3 and model 4.
+
+```{r}
+hf_dataset_resid <- hf_dataset %>%
+  mutate(
+    full_predictions = predict(full),
+    full_residuals   = resid(full)
+  )
+3
+
+plot_full <- hf_dataset_resid %>%
+  ggplot(aes(x = full_predictions, y = full_residuals)) + 
+  geom_point() + stat_smooth()
+
+plot_full
+```
+
+
+
+```{r}
+# Scatterplot with interaction lines
+ggplot(hf_dataset, aes(x = log_size, y = mmlu_pro, color = training_stage)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  labs(title = "Scaling Laws: Performance by Model Size and Training Stage",
+       x = "Log10(Parameters)",
+       y = "MMLU-PRO Score",
+       color = "Training Stage") +
+  theme_minimal()
+
+# Fitted vs Residuals for Full Model
+plot(full, which = 1, main = "Full Model: Residuals vs Fitted", pch=16, col="purple")
+```
+
+## Regression Table Output
+
+```{r results='asis', echo=FALSE}
+# Extract the robust standard errors column from each coeftest object
+se_simple <- simple_rse[, 2]
+se_m2 <- m2_rse[, 2]
+se_m3 <- m3_rse[, 2]
+se_m4 <- m4_rse[, 2]
+se_full <- full_rse[, 2]
+
+suppressWarnings(
+  stargazer(simple, model_2, model_3, model_4, full, 
+            type = "html", 
+            title = "Model Performance Across Size, Training Stage, and Instruction Following",
+            dep.var.labels = "MMLU-PRO Score",
+            column.labels = c("Simple", "Main Effects", "+ IFEval", "Interaction", "Full Model"),
+            covariate.labels = c("Log(Parameters)", 
+                                 "Chat-Instruct", 
+                                 "Fine-tuned", 
+                                 "Other", 
+                                 "Pretrained", 
+                                 "IFEval Score", 
+                                 "Log(Params) × Chat-Instruct", 
+                                 "Log(Params) × Fine-tuned", 
+                                 "Log(Params) × Other", 
+                                 "Log(Params) × Pretrained", 
+                                 "Base-Merge"),
+            notes = "Note: 'Base-Merge' is the reference category for Training Stage. Robust standard errors (HC3) reported in parentheses.",
+            se = list(se_simple, se_m2, se_m3, se_m4, se_full), 
+            header = FALSE)
+)

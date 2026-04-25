@@ -1,0 +1,164 @@
+---
+title: "Right-Sized Intelligence: Using Model Capacity and Training Stage to Choose Effective Large Language Models"
+output: html_document
+date: "2026-03-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r package loads, message=FALSE}
+library(tidyverse)
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+## Data
+
+Data for this project is obtained from public Open LLM Leaderboard “contents” dataset hosted by Hugging Face, which provides standardized evaluation scores and metadata for many large language models.(https://huggingface.co/datasets/open-llm-leaderboard/contents)
+
+## Explore dataset
+
+```{r}
+# number of rows
+cat("Number of rows in datset:",nrow(hf_dataset_full),"\n")  # 4576
+
+# number of columns
+cat("Number of columns in dataset:",ncol(hf_dataset_full),"\n") # 36
+
+# names of columns
+names(hf_dataset_full)
+
+# Structure of the dataset
+str(hf_dataset_full)
+
+# unique values in each column (as counts)
+sapply(hf_dataset_full, function(x) length(unique(x)))
+
+# inspect the actual unique values per column
+uniques <- lapply(hf_dataset_full, unique)
+#uniques$"precision" 
+uniques$"type"
+```
+
+# Clean data
+
+```{r}
+colSums(is.na(hf_dataset_full))
+
+# count empty strings "" per column
+colSums(hf_dataset_full == "", na.rm = TRUE) # architecture:6, upload_to_hub_date : 530, submission_date :12 
+
+# Check if x_params_b  have an invalid data: -1 or 0
+
+invalid_params <- hf_dataset_full %>%
+  filter(x_params_b %in% c(-1, 0)) %>%
+  nrow()
+
+invalid_params
+
+# Find eval_names that have more than one precision value
+conflicting_precision <- hf_dataset_full %>%
+  group_by(fullname) %>%
+  summarise(
+    n_precision = n_distinct(precision),
+    precisions = paste(sort(unique(precision)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_precision > 1)
+
+
+conflicting_precision
+
+```
+
+
+```{r}
+
+# Finding the oldest and latest submission dates in the dataset
+# replace empty strings with NA
+hf_dataset_full$submission_date[hf_dataset_full$submission_date == ""] <- NA
+hf_dataset_full$submission_date <- as.Date(hf_dataset_full$submission_date, format = "%Y-%m-%d")
+class(hf_dataset_full$submission_date)
+min(hf_dataset_full$submission_date, na.rm = TRUE) # 2024-06-08
+max(hf_dataset_full$submission_date, na.rm = TRUE) # 2025-03-13
+```
+```{r,warning=FALSE}
+# Plot for No. of parameters vs Time
+
+ggplot(hf_dataset_full, aes(x = submission_date, y = x_params_b)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  scale_x_date(
+    date_breaks = "1 month",          # show every month
+    date_labels = "%b %Y"             # e.g., Jun 2024
+  ) +
+  #scale_y_continuous(trans = "log")+
+
+  scale_y_log10(
+    breaks = c(0.01, 0.1, 1, 10, 100),
+    labels = c("0.01B", "0.1B", "1B", "10B", "100B")) +   #log scale for y-axis
+  labs(
+    x = "Submission date",
+    y = "Number of parameters (billions, log10 scale)",
+    title = "Trend in model size over time"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # slant labels
+  )
+```
+
+```{r}
+# Check count of entries before 2024-06-26 (As mentioned in the descriptive file, we need to remove these entries to avoid IID violations)
+
+count_before <- hf_dataset_full %>%
+  dplyr::filter(submission_date < as.Date("2024-06-26")) %>%
+  nrow()
+
+count_before
+```
+
+
+```{r}
+hf_dataset <- hf_dataset_full %>%
+  mutate(flagged = flagged %in% c("True", "TRUE")) %>% # TRUE only when text is 'True'
+  filter(!is.na(submission_date)) %>%
+  filter(submission_date >= as.Date("2024-06-26")) %>%  # drop everything before June 26, 2024
+  filter(!flagged) %>% # keep rows where flagged == False or NA
+  filter(!(x_params_b %in% c(-1, 0))) %>% # drop rows where x_params_b is -1 or 0
+  arrange(fullname, desc(precision)) %>%    # sort so highest precision per fullname is first
+  distinct(fullname, .keep_all = TRUE) %>%  # keep one row (max precision) per fullname (deduplicate precision values)
+  select(fullname, type, architecture, average, x_params_b, mo_e, co_cost_kg, if_eval_raw,if_eval,
+         bbh_raw, bbh, math_lvl_5_raw, math_lvl_5, gpqa_raw, gpqa, musr_raw, musr, mmlu_pro_raw, mmlu_pro,  
+         submission_date)
+
+```
+
+## Explore the clean dataset
+```{r}
+# number of rows
+cat("Number of rows in datset:",nrow(hf_dataset),"\n")  #4285 (removed 291)
+
+# number of columns
+cat("Number of columns in dataset:",ncol(hf_dataset),"\n") #20 (removed 16)
+
+# names of columns
+names(hf_dataset)
+
+# Structure of the dataset
+str(hf_dataset)
+```
+
+
+
+```{r}
+# Clean dataset
+
+write.csv(hf_dataset, here("data/interim/hf_dataset_clean.csv"), row.names = FALSE)
+```
+
+

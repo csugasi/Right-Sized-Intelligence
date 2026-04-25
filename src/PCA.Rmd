@@ -1,0 +1,243 @@
+---
+title: "Right-Sized Intelligence: Using Model Capacity and Training Stage to Choose Effective Large Language Models"
+output: html_document
+date: "2026-03-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# install and load packages if needed
+install_and_load <- function(package_name) {
+  if (!require(package_name, character.only = TRUE)) {
+    install.packages(package_name, dependencies = TRUE)
+    library(package_name, character.only = TRUE)
+  }
+}
+
+packages <- c("corrr", "ggcorrplot", "FactoMineR", "factoextra", "psych")
+for (pkg in packages) {
+  install_and_load(pkg)
+}
+
+```
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(here)
+```
+
+## Principle Component Analysis
+
+Since we have multiple benchmarks (outcome variables) to consider, it would be helpful to understand the relationship between them: how similar or different they are. Assumptions: continuous variables, linear relationships between variables (PCA could miss information here if not), adequate sample size (5-10 observations/variable), adequate correlation between variables, and no extreme outliers. We can be confident in continuous variables and size, pretty confident in linear relationships (will check), and should check on outliers and correlation. (https://statistics.laerd.com/spss-tutorials/principal-components-analysis-pca-using-spss-statistics.php)
+
+```{r}
+hf_dataset <- read.csv(here("data/interim/hf_dataset_clean.csv"))
+```
+
+```{r}
+benchmarks <- c("if_eval", "bbh", "math_lvl_5","gpqa", "musr", "mmlu_pro")
+
+pca_df <- hf_dataset %>%
+  select(all_of(benchmarks)) 
+view(pca_df)
+```
+
+
+```{r}
+# Print the min and max value of each benchmark to check where the outliers belong
+min_max_long <- hf_dataset %>%
+  summarise(across(
+    all_of(benchmarks),
+    list(min = ~min(.x, na.rm = TRUE),
+         max = ~max(.x, na.rm = TRUE)),
+    .names = "{.col}.{.fn}"      # e.g. if_eval.min, if_eval.max
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to  = c("benchmark", ".value"),
+    names_sep = "\\." #split at the dot
+  )
+
+min_max_long
+```
+
+```{r}
+# TRUE/FALSE matrix: TRUE where |z| > 3
+is_outlier <- abs(scale(pca_df)) > 3
+
+# 1) Table of column → how many outliers 
+colSums(is_outlier)
+
+# 2) Long table of all outlier cells with row index and value
+outlier_details <- which(is_outlier, arr.ind = TRUE) %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    row_id   = row,
+    column   = colnames(pca_df)[col],
+    value    = pca_df[cbind(row, col)],
+    z_score  = scale(pca_df)[cbind(row, col)]
+  ) %>%
+  dplyr::select(row_id, column, value, z_score)
+
+outlier_details
+
+```
+There are outliers outside 3 standard deviations (all on the high end), with the bulk being from MATH (9), gpqa (13), and musr (15). 
+
+Ultimately, we want to keep these high performing models in the analysis as they are relevant to the question we're asking. What we'd want to exclude are near 0 models where something could be broken or very high single benchmark scores where there could be contamination. These scores are high but don't appear to be near perfect. An analysis with/without outliers shows that they are making a difference, but we think it would be less informative to remove them.
+
+```{r}
+outlier_df <- sapply(pca_df, function(x) {
+    abs(scale(x)) > 3
+    })
+outlier_df <- as.data.frame(outlier_df)
+names(outlier_df) <- paste0(names(outlier_df), "_outlier")
+pca_w_outliers <- cbind(pca_df, outlier_df) 
+
+pca_w_outliers$outlier <- ifelse(
+  pca_w_outliers$if_eval_outlier == "TRUE" | pca_w_outliers$bbh_outlier == "TRUE" | pca_w_outliers$math_lvl_5_outlier == "TRUE" | pca_w_outliers$gpqa_outlier == "TRUE" | pca_w_outliers$musr_outlier == "TRUE" | pca_w_outliers$mmlu_pro_outlier,1,0)
+view(pca_w_outliers)  
+pca_w_outliers <- pca_w_outliers %>%
+  select(-if_eval_outlier,-bbh_outlier, -math_lvl_5_outlier, -gpqa_outlier, -musr_outlier, -mmlu_pro_outlier)
+view(pca_w_outliers)
+
+# Remove outliers (40 records)
+pca_no_outliers <- pca_w_outliers %>%
+  filter(pca_w_outliers$outlier == FALSE) %>%
+  select( -outlier)
+```
+
+```{r}
+# Standardize benchmarks
+pca_normal <- scale(pca_df)
+head(pca_normal)
+
+pca_no_outliers_normal <- scale(pca_no_outliers)
+
+# Check out correlation matrix to make sure PCA will be effective (i.e. that correlation exists, higher means more redundancy PCA can compress)
+corr_matrix <- cor(pca_normal)
+colnames(corr_matrix) <- c("GPQA", "BBH", "MMLU-Pro",
+                           "IF-Eval", "Math Lvl 5", "MUSR")
+rownames(corr_matrix) <- colnames(corr_matrix)
+
+ggcorrplot(
+  corr_matrix,
+  hc.order = TRUE,
+  type = "lower",
+  lab = TRUE,
+  title = "Correlation Matrix of LLM Benchmark Scores"
+) +
+  labs(
+    x = "Benchmarks",
+    y = "Benchmarks"
+  )
+
+
+```
+
+There is some correlation across all pairs and the cluster of MMLU-Pro, bbh, and gpqa is particularly high. 
+
+```{r}
+
+# KMO: Kaiser-Meyer-Olkin tests whether there is correlation and how much of the variance in each variable is shared with other variables. > 0.7 is generally adequate for PCA, > 0.8 is good, >0.9 better. Our dataset passes this test.
+KMO(pca_normal)
+```
+
+With KMO scores above 0.8 and 4/6 near or above 0.9, our dataset satisfies this assumption. 
+
+
+```{r}
+# Running PCA to see how much of the variance is explained by how many PCs
+pca_result <- prcomp(pca_normal, center = TRUE, scale. = FALSE) # could use arg scale. = TRUE instead of normalizing before
+print("With outliers:")
+summary(pca_result)
+
+# Checking with and without outliers
+pca_without <- prcomp(pca_no_outliers_normal, center = TRUE, scale. = FALSE)
+print("Without outliers:")
+summary(pca_without)
+
+```
+With/without outliers are very close, but we need to check the loadings matrix to see how each benchmark is impacted. Either way, looks like PC1 and PC2 capture ~85% of the total variance which means they can accurately represent the data. That means a single dimension captures most of the variation across all 6; models that score high on one benchmark, tend to score high on all of them. 
+
+```{r}
+# Looking at the loadings matrix shows how each benchmark contributes to each PCA (correlation between the benchmark and the component)
+cat("\t\t\tLoading Matix\n")
+cat("With outliers:\n")
+pca_result$rotation[, 1:6]
+
+cat("\nWithout outliers:\n")
+pca_without$rotation[, 1:6]
+```
+These loadings are very similar, suggesting that the outliers aren't distorting the PCA. And it may be more distorting to remove these high performers. We will go forward with outliers included.
+
+```{r}
+# Scree plot: visualize each PC's variance explained
+fviz_eig(pca_result, addlabels = TRUE)+
+  labs(
+    title = "Explained Variance by Principal Component",
+    x = "Principal Components",
+    y = "Percentage of Variance Explained"
+  )
+```
+The scree plot can show you the "elbow" where the curve flattens and inform how many components you retain. There's an argument for just PCA1, but including PCA2 gets over a common cumulative threshold of 80%. 
+```{r}
+# Kaiser criterion retains components with eigenvalues greater than 1 (the component explains more variance than any single variable)
+pca_result$sdev^2
+```
+
+The 80% threshold is more important here, but PC1 is very strong, and PC2 is still relatively strong although under 1.  
+
+```{r}
+pca_result$rotation[,1:2]
+```
+PC1 has relatively close positive loadings across benchmarks (.32-.45) meaning PC1 is a "general capability" component. A model with a high PC1 does well across benchmarks. if_eval is slightly lower, but clearly still aligned with the other benchmarks here. It represents 73% of the variance meaning the benchmarks are substantially redundant and 73% of their information can be captured by a single score. 
+PC2 shows if_eval with a high negative value, gpqa and musr with strong positive values, and bbh, MATH, and MMLU near zero. It separates models that are weak at following instructions but good at multi-step soft reasoning, or vice versa. A model with a high PC2 is good at musr style reasoning relative to its if_eval score. It suggests that instruction following and reasoning ability might be partially independent measures of model quality. The instruction-following vs reasoning tradeoff could be a meaningful design choice to consider in model development. 
+
+```{r}
+# Biplot to show the similarities and differences between benchmarks and impact of each on PCA
+fviz_pca_var(pca_result, col.var = "black")
+
+```
+In the biplot we see all benchmarks in the same dimension 1 direction, but spread across dimension 2 with if_eval being more strongly negative, most benchmarks being nearer to zero, and musr more strongly positive. The longer their arrow, the better represented the benchmark is.
+
+```{r}
+# Use the square cosine to determine how much each benchmark is represented in PC1 and PC2
+fviz_cos2(pca_result, choice = "var", axes = 1:2)
+```
+There is good overall representation with slighty less than 75% for math_lvl_5.
+
+```{r}
+# Combine biplot and square cosine to show representation alongside similarities and differences
+fviz_pca_var(pca_result, col.var = "cos2",
+            gradient.cols = c("orange", "black", "blue"),
+            repel = TRUE) +
+  labs(
+    title = "Benchmark Contributions to PC1 and PC2 (Colored by cos²)",
+    x = "PC1 (73.5% of variance)",
+    y = "PC2 (12.5% of variance)"
+  )
+```
+
+
+## PCA Conclusion
+
+Overall, PC1 offers a strong general performance benchmark for use in the model, rather than all 6. Within PC1, bbh and mmlu_pro have the highest loadings and represent the best proxies for general capability (if needed). PC2 offers an interesting option to see the tradeoff between reasoning and following instructions. This handles multicollinearity and reduces overfitting but comes with the drawback of making the interpretation more abstract from the original data. 
+
+```{r}
+# Adding PC scores to dataset
+hf_pca_scored <- hf_dataset %>%
+  select(-all_of(outliers))
+
+hf_pca_scored$PC1 <- pca_result$x[, 1]
+hf_pca_scored$PC2 <- pca_result$x[, 2]
+
+view(hf_pca_scored)
+```

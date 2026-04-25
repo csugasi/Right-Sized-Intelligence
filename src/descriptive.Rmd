@@ -1,0 +1,214 @@
+---
+title: "Right-Sized Intelligence: Using Model Capacity and Training Stage to Choose Effective Large Language Models"
+output: html_document
+date: "2026-03-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r package loads, message=FALSE}
+library(tidyverse)
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(here)
+```
+
+
+```{r}
+hf_dataset <- read.csv(here("data/interim/hf_dataset_clean.csv"))
+```
+
+## Descriptive Work
+
+Goal is to conduct descriptive work to find patterns/ trends in data
+
+1. No. of parameters vs Time
+2. Each benchmark(RAW) vs No of parameters
+3. No.of parameters and C02 emission
+
+
+```{r}
+# Checking data for missing data points between mid june 2024 to july 2024
+
+hf_dataset$submission_date <- as.Date(hf_dataset$submission_date, format = "%Y-%m-%d")
+# Overall date range
+range(hf_dataset$submission_date, na.rm = TRUE)
+
+# Count rows per month to see gaps
+hf_dataset %>%
+  count(month = format(submission_date, "%Y-%m")) %>%
+  arrange(month)
+
+# Define the date range
+start_date <- as.Date("2024-06-01")
+end_date   <- as.Date("2024-06-30")
+
+# Count rows per existing day in the data
+daily_counts <- hf_dataset %>%
+  filter(submission_date >= start_date,
+         submission_date <= end_date) %>%
+  count(submission_date, name = "n")
+
+# Fill in missing days with 0
+all_days <- tibble(submission_date = seq(start_date, end_date, by = "day"))
+
+daily_counts_full <- all_days %>%
+  left_join(daily_counts, by = "submission_date") %>%
+  mutate(n = replace_na(n, 0)) %>%
+  arrange(submission_date)
+
+daily_counts_full
+
+ggplot(daily_counts_full,
+       aes(x = submission_date, y = n)) +
+  geom_col(fill = "black") +
+  scale_x_date(date_breaks = "3 days",
+               date_labels = "%d %b") +
+  labs(
+    x = "Date",
+    y = "Number of rows",
+    title = "Daily submission counts, 1–30 June 2024"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# Reason for the June 2024 data gap in the Hugging Face Open LLM Leaderboard
+
+In the time–series of submissions on the Hugging Face Open LLM Leaderboard, a distinct gap appears in June–July 2024 in the plot of submission date versus number of parameters. To determine whether this was a plotting artifact or a real phenomenon, submissions were first counted by month and then by individual day within June 2024, revealing that many days in that month had zero entries. This confirms that the gap is not caused by rendering or axis–scaling issues but reflects genuine missing activity in the underlying data. A news article dated June 26, 2024 reports that Hugging Face significantly updated and revamped the Open LLM Leaderboard around this period, suggesting that the observed gap likely corresponds to changes in the leaderboard infrastructure and submission process rather than an error in the data processing pipeline. (https://venturebeat.com/ai/hugging-faces-updated-leaderboard-shakes-up-the-ai-evaluation-game)
+
+Based on this observation, all data before June 26, 2024 will be removed from the dataset to avoid IID voilations
+
+```{r}
+# Plot for No. of parameters vs Time
+
+ggplot(hf_dataset, aes(x = submission_date, y = x_params_b)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  scale_x_date(
+    date_breaks = "1 month",          # show every month
+    date_labels = "%b %Y"             # e.g., Jun 2024
+  ) +
+  
+
+  scale_y_continuous(
+    labels = scales::label_number(accuracy = 0.1, suffix = "B")
+  )+
+  labs(
+    x = "Submission date",
+    y = "Number of parameters (billions, log10 scale)",
+    title = "Trend in model size over time"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # slant labels
+  )
+```
+On the natural (non‑log) scale, the plot will look very compressed near zero with a few very large models dominating the vertical range.
+Most models are relatively small (a few billion parameters), but a handful are extremely large (tens or hundreds of billions).
+On a regular y‑axis, those very large models stretch the scale so much that the majority of points get squashed into a narrow band near the bottom. It becomes hard to visually compare differences among the smaller and medium‑sized models because everything below, say, 10B looks almost flat.
+
+Using a log scale spreads out small, medium, and large models more evenly, so trends over time are easier to interpret.
+
+```{r}
+# Each benchmark vs No of parameters
+hf_long <- hf_dataset %>%
+  select(
+    x_params_b,
+    average, if_eval, bbh,
+    math_lvl_5, gpqa, musr, mmlu_pro
+  ) %>%
+  pivot_longer(
+    cols = c(average, if_eval, bbh,
+             math_lvl_5, gpqa, musr, mmlu_pro),
+    names_to = "benchmark",
+    values_to = "score"
+  )
+
+#Side-by-side plots ( one panel per benchmark)
+ggplot(hf_long, aes(x = x_params_b, y = score)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  facet_wrap(~ benchmark, scales = "fixed") +
+  scale_y_continuous(limits = c(0,100))+
+  scale_x_continuous(breaks = seq(0, max(hf_long$x_params_b, na.rm = TRUE), by = 20)) +
+  labs(
+    x = "Parameters (billions)",
+    y = "Benchmark score (Accuracy style percentages)",
+    title = "Benchmark performance vs. model size"
+  ) +
+  theme_minimal()
+```
+```{r}
+ggplot(hf_long, aes(x = x_params_b, y = score)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  facet_wrap(~ benchmark, scales = "fixed") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_log10() +
+  labs(
+    x = "Parameters (billions, log10 scale)",
+    y = "Benchmark score (accuracy-style percentages)",
+    title = "Benchmark performance vs. model size (log10 parameters)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# One combined plot with all benchmarks
+
+ggplot(hf_long, aes(x = x_params_b, y = score, color = benchmark)) +
+  geom_point(alpha = 0.5) +
+  #geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    x = "Parameters (billions)",
+    y = "Benchmark score (Accuracy style percentages)",
+    color = "Benchmark",
+    title = "All benchmarks vs. model size"
+  ) +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(
+    breaks = seq(0, max(hf_long$x_params_b, na.rm = TRUE), by = 20)
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Plot No.of parameters and C02 emission
+ggplot(hf_dataset, aes(x = x_params_b, y = co_cost_kg)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "Number of parameters (billions, log10 scale)",
+    y = "CO₂ emissions (kg, log10 scale)",
+    title = "Relationship between model size and CO₂ emissions"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Plot Model size vs. CO₂ emissions by type
+ggplot(hf_dataset, aes(x = x_params_b, y = co_cost_kg)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ type) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "Number of parameters (billions, log10 scale)",
+    y = "CO₂ emissions (kg, log10 scale)",
+    title = "Model size vs. CO₂ emissions by type"
+  ) +
+  theme_minimal()
+```
+
